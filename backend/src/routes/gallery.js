@@ -29,7 +29,7 @@ const { resolveGuest } = require('../middleware/guestAuth');
 const { generateGuestIdentifier } = require('../middleware/feedbackRateLimit');
 const secureImageService = require('../services/secureImageService');
 const logger = require('../utils/logger');
-const { resolvePhotoFilePath } = require('../services/photoResolver');
+const { resolvePhotoFilePath, resolvePhotoStorageKey } = require('../services/photoResolver');
 const { getEventShareToken, resolveShareIdentifier, buildShareLinkVariants } = require('../services/shareLinkService');
 const { handleAsync, errorResponse } = require('../utils/routeHelpers');
 const { NotFoundError } = require('../utils/errors');
@@ -903,9 +903,19 @@ router.get('/:slug/download/:photoId', verifyGalleryAccess, denySlideshowToken, 
       photo_id: photoId
     });
     
-    let filePath;
+    // Managed photos live in the storage backend — local disk OR S3. This
+    // route used to resolve a local filesystem path unconditionally, so on
+    // S3/R2 deployments every single-photo download 404'd (ENOENT) while
+    // download-all and secure-images, which already go through getStorage(),
+    // worked fine. Resolve the storage key first; external-mode photos never
+    // live in the managed backend and keep the local-path fallback.
+    let storageKey = null;
+    let filePath = null;
     try {
-      filePath = resolvePhotoFilePath(req.event, photo);
+      storageKey = resolvePhotoStorageKey(req.event, photo);
+      if (!storageKey) {
+        filePath = resolvePhotoFilePath(req.event, photo);
+      }
     } catch (resolveError) {
       logger.error('Failed to resolve photo path for download', {
         slug: req.params.slug,
@@ -936,7 +946,23 @@ router.get('/:slug/download/:photoId', verifyGalleryAccess, denySlideshowToken, 
         enabled: true,
         text: req.event.watermark_text || watermarkSettings?.text || 'Protected'
       };
-      const watermarkedBuffer = await watermarkService.applyWatermark(filePath, effectiveSettings);
+      // In S3 mode there is no local path to hand sharp, so materialize a
+      // tmp copy via withLocalCopy (same pattern as secure-images) and run
+      // the identical watermarking on it.
+      let watermarkedBuffer;
+      try {
+        watermarkedBuffer = storageKey
+          ? await withLocalCopy(storageKey, (lp) => watermarkService.applyWatermark(lp, effectiveSettings))
+          : await watermarkService.applyWatermark(filePath, effectiveSettings);
+      } catch (fetchError) {
+        logger.error('Failed to fetch photo for download', {
+          slug: req.params.slug,
+          photoId,
+          eventId: req.event.id,
+          error: fetchError.message,
+        });
+        return res.status(404).json({ error: 'Photo file not found' });
+      }
 
       res.set({
         'Content-Type': photo.mime_type || 'image/jpeg',
@@ -954,6 +980,38 @@ router.get('/:slug/download/:photoId', verifyGalleryAccess, denySlideshowToken, 
         'Content-Type': photo.mime_type || 'image/jpeg',
         'Content-Disposition': contentDisposition,
       });
+      if (storageKey) {
+        // Stream straight from the storage backend (works for both the
+        // local-fs and S3 backends). Piping rather than buffering keeps
+        // memory flat for as-is video downloads, which can be large.
+        let stream;
+        try {
+          stream = await getStorage().get(storageKey);
+        } catch (fetchError) {
+          logger.error('Error streaming gallery download', {
+            slug: req.params.slug,
+            photoId,
+            eventId: req.event.id,
+            error: fetchError.message,
+          });
+          return res.status(404).json({ error: 'Photo file not found' });
+        }
+        stream.on('error', (streamError) => {
+          logger.error('Error streaming gallery download', {
+            slug: req.params.slug,
+            photoId,
+            eventId: req.event.id,
+            error: streamError.message,
+          });
+          if (!res.headersSent) {
+            res.status(404).json({ error: 'Photo file not found' });
+          } else {
+            res.destroy();
+          }
+        });
+        stream.pipe(res);
+        return;
+      }
       res.sendFile(filePath, (downloadError) => {
         if (downloadError) {
           logger.error('Error streaming gallery download', {
