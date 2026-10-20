@@ -948,6 +948,10 @@ async function startServer() {
     setInterval(cleanupTempUploads, 60 * 60 * 1000);
     logger.info('Temp upload cleanup scheduled');
     
+    // A pre-zip build the process died in the middle of (reboot, OOM kill)
+    // leaves its partial zip in the tmp dir — on Docker, the container layer.
+    require('./src/services/downloadZipService').sweepStaleBuildDirs().catch(() => {});
+
     // Start file watcher
     startFileWatcher();
     
