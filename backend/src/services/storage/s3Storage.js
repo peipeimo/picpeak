@@ -70,6 +70,18 @@ class S3StorageAdapter extends stream.EventEmitter {
     const s3Config = {
       region: this.config.region,
       forcePathStyle: this.config.forcePathStyle,
+      // ROOT CAUSE of the 2026-10 upload hangs (proven against R2): since
+      // @aws-sdk/client-s3 3.729 the client validates response checksums by
+      // default and hands every GetObject caller a ChecksumStream wrapper.
+      // ChecksumStream pipes the real IncomingMessage into itself and has no
+      // _destroy, so when a caller destroys the Body (a cancelled pre-zip
+      // build, a failed download) the IncomingMessage is only unpiped and
+      // paused, never destroyed, and its socket never returns to the 50-slot
+      // pool. Under sustained uploads the pool fills and every S3 request
+      // queues forever. WHEN_REQUIRED returns the IncomingMessage itself, so
+      // destroying the Body frees the socket. Uploads keep their checksums
+      // (requestChecksumCalculation is unchanged); R2 still validates them.
+      responseChecksumValidation: 'WHEN_REQUIRED',
       // Without timeouts a silently dropped connection leaves the request —
       // and with it every queued upload — hanging forever.
       //

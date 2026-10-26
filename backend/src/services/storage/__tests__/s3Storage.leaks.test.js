@@ -43,6 +43,14 @@ describe('S3 socket leaks (p8)', () => {
     jest.restoreAllMocks();
   });
 
+  describe('S3 client configuration', () => {
+    it('does not wrap GetObject bodies in a ChecksumStream that cannot be destroyed', () => {
+      // A ChecksumStream Body leaks its socket when destroyed (proven
+      // against R2 on 2026-10-26); WHEN_REQUIRED hands out the real response.
+      expect(S3Client).toHaveBeenCalledWith(expect.objectContaining({ responseChecksumValidation: 'WHEN_REQUIRED' }));
+    });
+  });
+
   describe('abandoned response bodies', () => {
     it('destroys a body nobody reads, so its socket returns to the pool', async () => {
       fakeClock();
