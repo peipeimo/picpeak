@@ -118,17 +118,18 @@ describe('S3 socket leaks (p8)', () => {
       const second = { on: jest.fn(), done: jest.fn().mockResolvedValue({ Location: 'ok' }) };
       Upload.mockImplementationOnce(() => first).mockImplementationOnce(() => second);
       jest.spyOn(Math, 'random').mockReturnValue(0);
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's3up-'));
-      const file = path.join(dir, 'p.jpg');
-      fs.writeFileSync(file, 'jpeg');
+      jest.spyOn(fs.promises, 'stat').mockResolvedValue({ size: 4 });
+      // Own mock: another suite in the same worker may have left
+      // createReadStream returning one shared object.
+      const open = jest.spyOn(fs, 'createReadStream').mockImplementation(() => new PassThrough());
 
-      const result = await s3.upload(file, 'events/active/g/p.jpg');
+      const result = await s3.upload('/tmp/p.jpg', 'events/active/g/p.jpg');
 
       expect(result.Location).toBe('ok');
       expect(Upload).toHaveBeenCalledTimes(2);
+      expect(open).toHaveBeenCalledTimes(2);
       const bodies = Upload.mock.calls.map((c) => c[0].params.Body);
       expect(bodies[0]).not.toBe(bodies[1]);
-      fs.rmSync(dir, { recursive: true, force: true });
     });
   });
 });
