@@ -62,6 +62,7 @@ class S3StorageAdapter extends stream.EventEmitter {
       retryDelay: 1000,
       connectionTimeout: 120000,
       socketTimeout: 60000,
+      bodyIdleMs: 300000,
       ...config
     };
     
@@ -200,14 +201,10 @@ class S3StorageAdapter extends stream.EventEmitter {
       // Emit upload start event
       this.emit('uploadStart', { key: s3Key, size: fileSize });
       
-      // Create file stream
-      const fileStream = fs.createReadStream(localPath);
-      
-      // Prepare upload parameters
+      // Prepare upload parameters. Body is set per attempt below.
       const uploadParams = {
         Bucket: this.bucket,
         Key: s3Key,
-        Body: fileStream,
         ContentType: options.contentType || 'application/octet-stream',
         Metadata: options.metadata || {},
         CacheControl: options.cacheControl
@@ -216,25 +213,30 @@ class S3StorageAdapter extends stream.EventEmitter {
       // Remove undefined values
       Object.keys(uploadParams).forEach(key => uploadParams[key] === undefined && delete uploadParams[key]);
       
-      // Use AWS SDK v3 Upload for automatic multipart handling
-      const parallelUploads3 = new Upload({
-        client: this.s3Client,
-        params: uploadParams,
-        queueSize: 4, // Optional: concurrent uploads
-        partSize: this.config.partSize,
-        leavePartsOnError: false
-      });
-      
-      // Track upload progress
-      parallelUploads3.on('httpUploadProgress', (progress) => {
-        if (options.onProgress) {
-          options.onProgress(progress.loaded, progress.total);
-        }
-        this.emit('uploadProgress', { key: s3Key, loaded: progress.loaded, total: progress.total });
-      });
-      
+      // Each attempt needs a NEW Upload and a NEW file stream: lib-storage
+      // refuses a second .done() ("this instance of Upload has already
+      // executed .done()"), and the first attempt has consumed the stream.
+      // Retrying the same instance turned every retry into an instant
+      // failure (seen during the 2026-10 migration).
+      const attempt = () => {
+        const parallelUploads3 = new Upload({
+          client: this.s3Client,
+          params: { ...uploadParams, Body: fs.createReadStream(localPath) },
+          queueSize: 4, // Optional: concurrent uploads
+          partSize: this.config.partSize,
+          leavePartsOnError: false
+        });
+        parallelUploads3.on('httpUploadProgress', (progress) => {
+          if (options.onProgress) {
+            options.onProgress(progress.loaded, progress.total);
+          }
+          this.emit('uploadProgress', { key: s3Key, loaded: progress.loaded, total: progress.total });
+        });
+        return parallelUploads3.done();
+      };
+
       // Perform upload with retry
-      const result = await this._retryOperation(() => parallelUploads3.done());
+      const result = await this._retryOperation(attempt);
       
       this.emit('uploadComplete', { key: s3Key, location: result.Location });
       return result;
@@ -282,7 +284,10 @@ class S3StorageAdapter extends stream.EventEmitter {
       });
     }
     
-    return await this._retryOperation(() => parallelUploads3.done());
+    // No _retryOperation here: the caller's stream is consumed by the first
+    // attempt and cannot be replayed, and a second .done() on the same Upload
+    // throws. The SDK client still retries individual part requests.
+    return await parallelUploads3.done();
   }
   
   /**
@@ -335,11 +340,10 @@ class S3StorageAdapter extends stream.EventEmitter {
           this.emit('downloadProgress', { key: s3Key, loaded: downloaded, total: fileSize });
         });
         
-        bodyStream.on('error', reject);
-        writeStream.on('error', reject);
-        writeStream.on('finish', resolve);
-        
-        bodyStream.pipe(writeStream);
+        // pipeline, not pipe: on an error on EITHER side it destroys BOTH.
+        // With pipe, a write error unpiped and paused the body but never
+        // destroyed it, so its S3 socket stayed checked out of the pool.
+        stream.pipeline(bodyStream, writeStream, (err) => (err ? reject(err) : resolve()));
       });
       
       this.emit('downloadComplete', { key: s3Key });
@@ -369,7 +373,44 @@ class S3StorageAdapter extends stream.EventEmitter {
     Object.keys(params).forEach(key => params[key] === undefined && delete params[key]);
     
     const result = await this.s3Client.send(new GetObjectCommand(params));
-    return result.Body;
+    return this._guardBody(result.Body, s3Key);
+  }
+
+  /**
+   * Close an S3 response body that nobody reads any more.
+   *
+   * 2026-10 migration: under sustained uploads the S3 agent pool (50
+   * sockets) filled with GET bodies of original photos that some caller
+   * had piped, unpiped and abandoned: flowing=false, no pipes, no data
+   * listener, never ended. A body holds its socket until it is ended or
+   * destroyed, and the SDK clears its socket timeout once headers arrive,
+   * so nothing ever reclaimed them; at 50 every new S3 request queued
+   * forever and uploads hung. This guard destroys a body that has not
+   * received a byte for bodyIdleMs while not ended, freeing the slot, and
+   * logs the stack that opened it so the abandoning caller can be fixed.
+   * A body that is being read keeps moving bytes and is never touched.
+   */
+  _guardBody(body, s3Key) {
+    const idleMs = this.config.bodyIdleMs;
+    if (!body || typeof body.on !== 'function' || !(idleMs > 0)) return body;
+    const origin = new Error('S3 body opened here').stack;
+    const bytes = () => (body.socket && body.socket.bytesRead) || 0;
+    let last = bytes();
+    let lastMove = Date.now();
+    const timer = setInterval(() => {
+      if (body.destroyed || body.readableEnded) { clearInterval(timer); return; }
+      const now = bytes();
+      if (now !== last) { last = now; lastMove = Date.now(); return; }
+      if (Date.now() - lastMove < idleMs) return;
+      clearInterval(timer);
+      logger.warn('S3 response body abandoned; destroying it to free its socket', {
+        key: s3Key, idleMs: Date.now() - lastMove, flowing: body.readableFlowing, origin,
+      });
+      body.destroy();
+    }, Math.min(30000, idleMs));
+    if (timer.unref) timer.unref();
+    body.once('close', () => clearInterval(timer));
+    return body;
   }
   
   /**

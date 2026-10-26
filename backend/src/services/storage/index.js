@@ -53,6 +53,8 @@ function buildStorage() {
       sslEnabled: process.env.STORAGE_S3_SSL !== 'false',
       connectionTimeout: parseInt(process.env.STORAGE_S3_CONNECTION_TIMEOUT || '120000', 10),
       socketTimeout: parseInt(process.env.STORAGE_S3_SOCKET_TIMEOUT || '60000', 10),
+      // Destroy an S3 response body nobody has read for this long (p8).
+      bodyIdleMs: parseInt(process.env.STORAGE_S3_BODY_IDLE_MS || '300000', 10),
     });
   }
 
