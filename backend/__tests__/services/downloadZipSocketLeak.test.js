@@ -88,9 +88,11 @@ jest.mock('../../src/services/storage', () => ({
 
 // Nothing to resize or watermark, so the builder takes the stream-from-storage
 // branch, which is the one that holds sockets.
+// 3.45.16 backport: downloadRendition (#858) does not exist on this line;
+// the builder already streams from storage, so the mock is virtual.
 jest.mock('../../src/services/downloadRendition', () => ({
   renderPhotoForDownload: jest.fn(async () => null),
-}));
+}), { virtual: true });
 
 const { bootCrmDb, seedMinimal } = require('../integration/helpers/crmDb');
 const downloadZipService = require('../../src/services/downloadZipService');
