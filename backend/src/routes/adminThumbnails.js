@@ -34,6 +34,15 @@ function sameStorageKey(a, b) {
 // process; another replica can still start its own.
 const runningJobs = { thumbnails: false, previews: false };
 
+// Photos one preview regeneration works on at once. 1 (the default) is the old
+// one-by-one loop. Each photo spends most of its time fetching the original
+// from storage and writing the rendition back, so a few in flight keep the CPU
+// busy; every slot also holds one full-resolution decode in memory.
+function previewRegenConcurrency() {
+  const configured = Number.parseInt(process.env.PREVIEW_REGEN_CONCURRENCY || '1', 10);
+  return Number.isFinite(configured) && configured > 0 ? Math.min(configured, 8) : 1;
+}
+
 /**
  * Who may start a regeneration. Scoped to an event it is that event's photo
  * work, for whoever can act on the event. Unscoped it rebuilds every gallery
@@ -365,7 +374,8 @@ router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'),
     applicationWork.defer('preview regeneration', async () => {
       let successCount = 0;
       let errorCount = 0;
-      for (const photo of photos) {
+      const limit = require('p-limit')(previewRegenConcurrency());
+      await Promise.all(photos.map((photo) => limit(async () => {
         try {
           // Force regeneration regardless of existing preview state by
           // nulling the cached path so ensurePreviewImage doesn't
@@ -387,7 +397,7 @@ router.post('/regenerate-previews', adminAuth, requirePermission('photos.edit'),
           logger.error(`Error regenerating preview for photo ${photo.id}:`, error);
           errorCount++;
         }
-      }
+      })));
       runningJobs.previews = false;
       logger.info(`Preview regeneration complete: ${successCount} success, ${errorCount} errors`);
     });
